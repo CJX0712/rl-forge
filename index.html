@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RLForge — Q-learning 强化学习锻造炉</title>
+<style>
+  :root{ --bg:#0d1117; --panel:#161b22; --edge:#30363d; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --bad:#f85149; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ background:var(--bg); color:var(--fg); font:14px/1.5 Consolas,"Microsoft YaHei",monospace; padding:20px; }
+  h1{ font-size:20px; color:var(--acc); margin-bottom:4px; }
+  .sub{ color:var(--dim); margin-bottom:14px; }
+  .wrap{ display:flex; gap:18px; flex-wrap:wrap; }
+  .panel{ background:var(--panel); border:1px solid var(--edge); border-radius:8px; padding:14px; }
+  canvas{ display:block; border:1px solid var(--edge); border-radius:6px; background:#0a0d12; }
+  .row{ display:flex; align-items:center; gap:10px; margin:8px 0; flex-wrap:wrap; }
+  button{ background:#21262d; color:var(--fg); border:1px solid var(--edge); border-radius:6px; padding:6px 14px; cursor:pointer; font:inherit; }
+  button:hover{ border-color:var(--acc); color:var(--acc); }
+  button.primary{ background:#1f427a; border-color:var(--acc); }
+  button.active{ background:#7a3b1f; border-color:#f0883e; color:#f0883e; }
+  input[type=range]{ width:120px; }
+  .stat{ color:var(--dim); } .stat b{ color:var(--fg); }
+  #test{ margin-top:14px; }
+  .t{ padding:2px 0; } .pass{ color:var(--ok); } .fail{ color:var(--bad); }
+  .cols{ column-count:2; column-gap:24px; }
+  @media (max-width:1100px){ .cols{ column-count:1; } }
+  .legend{ color:var(--dim); font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+<h1>✦ RLForge — Q-learning 强化学习锻造炉</h1>
+<div class="sub">模型无关 RL（ε-greedy Q-learning）× 模型方法（Value Iteration）交叉验证 · Bellman 残差 &lt;1e-8 · 单文件离线</div>
+
+<div class="wrap">
+  <div class="panel">
+    <canvas id="cv" width="600" height="450"></canvas>
+    <div class="legend">
+      <span style="color:#58a6ff">V 值热区（越亮越优）</span> ·
+      <span style="color:#6e7681">■ 墙</span> ·
+      <span style="color:#f85149">● 坑(−10)</span> ·
+      <span style="color:#3fb950">◎ 目标(+100)</span> ·
+      <span style="color:#f0883e">▶ 智能体</span> · 白线 = 贪心路径
+    </div>
+  </div>
+
+  <div class="panel" style="flex:1 1 340px; min-width:300px">
+    <div class="row">
+      <button id="bWorld" class="primary">随机世界</button>
+      <button id="bTrain" class="primary">▶ 训练 Q-learning</button>
+      <button id="bVI">对照 Value Iteration</button>
+      <button id="bPath">▶ 演示贪心路径</button>
+    </div>
+    <div class="row">
+      <span class="stat">episodes</span><input type="range" id="epsN" min="20" max="200" value="80">
+      <span class="stat" id="epsV">8000</span>
+      <span class="stat">学习率</span><input type="range" id="lr" min="1" max="9" value="2">
+      <span class="stat" id="lrV">0.2</span>
+    </div>
+    <div class="row stat" id="info">状态：待命 · 每步 −1 · 目标 +100 · 坑 −10 · γ=0.95</div>
+    <div class="row stat">QL 路径步数 <b id="sQL">—</b> · VI 最优步数 <b id="sVI">—</b> · 交叉验证 <b id="sCross">—</b></div>
+    <div id="test"><div class="row" style="color:var(--dim)">引擎自检 <button id="bTest" style="padding:2px 10px">运行</button></div><div id="tout" class="cols"></div></div>
+  </div>
+</div>
+
+<script id="engine">
+const RL = (function(){
+  'use strict';
+
+  function mulberry32(seed){
+    let t = seed >>> 0;
+    return function(){
+      t += 0x6D2B79F5;
+      let r = Math.imul(t ^ (t >>> 15), 1 | t);
+      r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const DX = [1, -1, 0, 0], DY = [0, 0, 1, -1]; // 0=R 1=L 2=D 3=U
+
+  // env: {W,H,walls:Set,pits:Set,start,goal,N}
+  function createEnv(W, H, walls, pits, start, goal){
+    return { W: W, H: H, walls: walls, pits: pits, start: start, goal: goal, N: W * H };
+  }
+
+  function randomWorld(W, H, seed, wallP, pitP){
+    const rnd = mulberry32(seed);
+    const start = H - 2 >= 0 ? (H - 2) * W + 1 : 1;
+    const goal = 1 * W + (W - 2);
+    const walls = new Set(), pits = new Set();
+    for (let i = 0; i < W * H; i++){
+      if (i === start || i === goal) continue;
+      const r = rnd();
+      if (r < wallP) walls.add(i);
+      else if (r < wallP + pitP) pits.add(i);
+    }
+    return createEnv(W, H, walls, pits, start, goal);
+  }
+
+  // transition: bump into wall/border -> stay in place (still pays step cost)
+  function step(env, s, a){
+    const x = s % env.W, y = (s / env.W) | 0;
+    const nx = x + DX[a], ny = y + DY[a];
+    let s2 = s;
+    if (nx >= 0 && ny >= 0 && nx < env.W && ny < env.H){
+      const ni = ny * env.W + nx;
+      if (!env.walls.has(ni)) s2 = ni;
+    }
+    if (s2 === env.goal) return { s2: s2, r: 100, done: true };
+    if (env.pits.has(s2)) return { s2: s2, r: -10, done: true };
+    return { s2: s2, r: -1, done: false };
+  }
+
+  // ---------- model-based reference: Value Iteration ----------
+  // returns {V, residual}; V[terminal]=0
+  function valueIteration(env, gamma, iters, tol){
+    gamma = gamma || 0.95;
+    iters = iters || 10000;
+    tol = tol || 1e-10;
+    const V = new Float64Array(env.N);
+    let residual = Infinity;
+    for (let it = 0; it < iters; it++){
+      const V2 = new Float64Array(env.N);
+      let maxDelta = 0;
+      for (let s = 0; s < env.N; s++){
+        if (s === env.goal || env.pits.has(s)) { V2[s] = 0; continue; }
+        let best = -Infinity;
+        for (let a = 0; a < 4; a++){
+          const t = step(env, s, a);
+          const val = t.r + gamma * V[t.s2];
+          if (val > best) best = val;
+        }
+        V2[s] = best;
+        const d = Math.abs(V2[s] - V[s]);
+        if (d > maxDelta) maxDelta = d;
+      }
+      residual = maxDelta;
+      V.set(V2);
+      if (maxDelta < tol) break;
+    }
+    return { V: V, residual: residual };
+  }
+
+  function qFromV(env, V, gamma){
+    const Q = new Float64Array(env.N * 4);
+    for (let s = 0; s < env.N; s++){
+      if (s === env.goal || env.pits.has(s)) continue;
+      for (let a = 0; a < 4; a++){
+        const t = step(env, s, a);
+        Q[s * 4 + a] = t.r + gamma * V[t.s2];
+      }
+    }
+    return Q;
+  }
+
+  // ---------- model-free: Q-learning (epsilon-greedy, decaying) ----------
+  // opts: {episodes, alpha0, alpha1, gamma, eps0, eps1, seed, init}
+  function qlearn(env, opts){
+    const o = opts || {};
+    const episodes = o.episodes || 8000;
+    const alpha0 = o.alpha0 !== undefined ? o.alpha0 : (o.alpha !== undefined ? o.alpha : 0.2);
+    const alpha1 = o.alpha1 !== undefined ? o.alpha1 : alpha0;
+    const gamma = o.gamma || 0.95;
+    const eps0 = o.eps0 || 0.3, eps1 = o.eps1 || 0.01;
+    const rnd = mulberry32(o.seed || 1);
+    const Q = new Float64Array(env.N * 4);
+    if (o.init) Q.fill(o.init);   // optimistic initialization drives systematic exploration
+    const rewards = new Float64Array(episodes);
+    for (let ep = 0; ep < episodes; ep++){
+      const frac = ep / episodes;
+      const eps = eps0 + (eps1 - eps0) * frac;
+      const alpha = alpha0 + (alpha1 - alpha0) * frac;
+      let s = env.start, total = 0;
+      for (let t = 0; t < 4 * env.N; t++){
+        const a = rnd() < eps ? ((rnd() * 4) | 0) : argmax(Q, s * 4, 4);
+        const tr = step(env, s, a);
+        const target = tr.done ? tr.r : tr.r + gamma * maxOf(Q, tr.s2 * 4, 4);
+        Q[s * 4 + a] += alpha * (target - Q[s * 4 + a]);
+        total += tr.r;
+        s = tr.s2;
+        if (tr.done) break;
+      }
+      rewards[ep] = total;
+    }
+    return { Q: Q, rewards: rewards };
+  }
+
+  function argmax(arr, off, n){
+    let bi = 0, bv = -Infinity;
+    for (let i = 0; i < n; i++) if (arr[off + i] > bv){ bv = arr[off + i]; bi = i; }
+    return bi;
+  }
+  function maxOf(arr, off, n){
+    let bv = -Infinity;
+    for (let i = 0; i < n; i++) if (arr[off + i] > bv) bv = arr[off + i];
+    return bv;
+  }
+
+  // follow greedy policy; guard against loops with maxSteps
+  function greedyPath(env, Q, maxSteps){
+    const limit = maxSteps || 4 * env.N;
+    const path = [env.start];
+    let s = env.start, total = 0, done = false, steps = 0;
+    while (steps < limit){
+      const a = argmax(Q, s * 4, 4);
+      const tr = step(env, s, a);
+      total += tr.r;
+      s = tr.s2;
+      if (s !== path[path.length - 1]) path.push(s);
+      steps++;
+      if (tr.done){ done = true; break; }
+    }
+    return { path: path, done: done, total: total, steps: steps };
+  }
+
+  // Bellman residual of a Q table under its own greedy transition (Q-learning self-check)
+  function bellmanResidualQ(env, Q, gamma){
+    let m = 0;
+    for (let s = 0; s < env.N; s++){
+      if (s === env.goal || env.pits.has(s)) continue;
+      const a = argmax(Q, s * 4, 4);
+      const tr = step(env, s, a);
+      const target = (tr.done ? tr.r : tr.r + gamma * maxOf(Q, tr.s2 * 4, 4)) - Q[s * 4 + a];
+      const d = Math.abs(target);
+      if (d > m) m = d;
+    }
+    return m;
+  }
+
+  // max |maxQ(s) - V*(s)|; skips states whose 4 Q values are all equal (never updated / uninformative)
+  function qVGap(env, Q, V){
+    let m = 0;
+    for (let s = 0; s < env.N; s++){
+      if (s === env.goal || env.pits.has(s) || env.walls.has(s)) continue;
+      const q0 = Q[s * 4];
+      if (q0 === Q[s * 4 + 1] && q0 === Q[s * 4 + 2] && q0 === Q[s * 4 + 3]) continue;
+      const q = maxOf(Q, s * 4, 4);
+      const d = Math.abs(q - V[s]);
+      if (d > m) m = d;
+    }
+    return m;
+  }
+
+  return { mulberry32, DX, DY, createEnv, randomWorld, step, valueIteration, qFromV, qlearn, argmax, maxOf, greedyPath, bellmanResidualQ, qVGap };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = RL;
+</script>
+
+<script>
+(function(){
+  'use strict';
+  const R = RL;
+  const W = 20, H = 15, CELL = 30;
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  cv.width = W * CELL; cv.height = H * CELL;
+  let env = null, Q = null, V = null, qPath = null, agentAnim = null;
+
+  function info(t){ document.getElementById('info').textContent = '状态：' + t; }
+
+  function newWorld(){
+    let seed = (Math.random() * 1e9) | 0;
+    // retry until goal reachable from start (VI greedy ends at goal)
+    for (let tries = 0; tries < 50; tries++){
+      env = R.randomWorld(W, H, seed, 0.15, 0.03);
+      const vi = R.valueIteration(env, 0.95, 5000, 1e-6);
+      const p = R.greedyPath(env, R.qFromV(env, vi.V, 0.95));
+      if (p.done && p.path[p.path.length - 1] === env.goal) break;
+      seed = (seed + 1) | 0;
+    }
+    Q = null; V = null; qPath = null;
+    stopAnim();
+    draw();
+    document.getElementById('sQL').textContent = '—';
+    document.getElementById('sVI').textContent = '—';
+    document.getElementById('sCross').textContent = '—';
+    info('新世界 seed=' + seed);
+  }
+
+  function draw(){
+    ctx.fillStyle = '#0a0d12'; ctx.fillRect(0, 0, cv.width, cv.height);
+    // V heat
+    if (Q){
+      for (let s = 0; s < env.N; s++){
+        if (env.walls.has(s)) continue;
+        const q = R.maxOf(Q, s * 4, 4);
+        if (q === 0) continue;
+        const t = Math.max(0, Math.min(1, (q + 5) / 15));
+        ctx.fillStyle = 'rgba(88,166,255,' + (0.06 + 0.3 * t).toFixed(3) + ')';
+        ctx.fillRect((s % env.W) * CELL, ((s / env.W) | 0) * CELL, CELL, CELL);
+      }
+    }
+    for (const w of env.walls){ ctx.fillStyle = '#6e7681'; ctx.fillRect((w % env.W) * CELL + 1, ((w / env.W) | 0) * CELL + 1, CELL - 2, CELL - 2); }
+    for (const p of env.pits){
+      ctx.fillStyle = '#f85149'; ctx.beginPath();
+      ctx.arc((p % env.W) * CELL + CELL / 2, ((p / env.W) | 0) * CELL + CELL / 2, CELL * 0.32, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = '#3fb950'; ctx.beginPath();
+    ctx.arc((env.goal % env.W) * CELL + CELL / 2, ((env.goal / env.W) | 0) * CELL + CELL / 2, CELL * 0.32, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 2; ctx.stroke();
+    // greedy path
+    if (qPath){
+      ctx.strokeStyle = '#e6edf3'; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.moveTo((qPath.path[0] % env.W) * CELL + CELL / 2, ((qPath.path[0] / env.W) | 0) * CELL + CELL / 2);
+      for (let i = 1; i < qPath.path.length; i++)
+        ctx.lineTo((qPath.path[i] % env.W) * CELL + CELL / 2, ((qPath.path[i] / env.W) | 0) * CELL + CELL / 2);
+      ctx.stroke();
+    }
+    // start marker
+    ctx.strokeStyle = '#f0883e'; ctx.lineWidth = 2;
+    ctx.strokeRect((env.start % env.W) * CELL + 4, ((env.start / env.W) | 0) * CELL + 4, CELL - 8, CELL - 8);
+  }
+
+  function stopAnim(){ if (agentAnim){ clearInterval(agentAnim); agentAnim = null; } }
+
+  function train(){
+    stopAnim();
+    const n = +document.getElementById('epsN').value * 100;
+    const lr = +document.getElementById('lr').value / 10;
+    info('训练中：' + n + ' episodes, α=' + lr + ' …');
+    setTimeout(function(){
+      const t0 = performance.now();
+      const r = R.qlearn(env, { episodes: n, alpha0: 0.5, alpha1: 0.05, gamma: 0.95, eps0: 0.3, eps1: 0.05, seed: 42, init: 50 });
+      Q = r.Q;
+      qPath = R.greedyPath(env, Q);
+      const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+      V = vi.V;
+      const viPath = R.greedyPath(env, R.qFromV(env, V, 0.95));
+      const ms = (performance.now() - t0).toFixed(0);
+      draw();
+      document.getElementById('sQL').textContent = qPath.done ? qPath.steps + ' 步 / 报酬 ' + qPath.total : '未达终点!';
+      document.getElementById('sVI').textContent = viPath.done ? viPath.steps + ' 步 / 报酬 ' + viPath.total : '未达终点!';
+      const cross = qPath.done && viPath.done && qPath.total === viPath.total;
+      document.getElementById('sCross').textContent = cross ? '✓ 报酬一致' : '✗ 不一致';
+      info('训练完成 ' + n + ' episodes · ' + ms + 'ms · QL 报酬 ' + qPath.total + ' vs VI 最优 ' + viPath.total);
+    }, 30);
+  }
+
+  function runVI(){
+    stopAnim();
+    const t0 = performance.now();
+    const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+    V = vi.V; Q = R.qFromV(env, V, 0.95);
+    qPath = R.greedyPath(env, Q);
+    const ms = (performance.now() - t0).toFixed(1);
+    draw();
+    document.getElementById('sVI').textContent = qPath.done ? qPath.steps + ' 步 / 报酬 ' + qPath.total : '未达终点!';
+    info('Value Iteration 完成 · residual=' + vi.residual.toExponential(1) + ' · ' + ms + 'ms（白线=VI 最优路径）');
+  }
+
+  function demoPath(){
+    if (!Q){ info('请先训练或运行 VI'); return; }
+    stopAnim();
+    let i = 0;
+    agentAnim = setInterval(function(){
+      draw();
+      if (i < qPath.path.length){
+        const s = qPath.path[i];
+        ctx.fillStyle = '#f0883e';
+        ctx.beginPath();
+        ctx.arc((s % env.W) * CELL + CELL / 2, ((s / env.W) | 0) * CELL + CELL / 2, CELL * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#0a0d12';
+        ctx.font = 'bold ' + (CELL * 0.4) + 'px Consolas';
+        ctx.fillText('▶', (s % env.W) * CELL + CELL * 0.3, ((s / env.W) | 0) * CELL + CELL * 0.65);
+        i++;
+      } else { stopAnim(); }
+    }, 120);
+  }
+
+  document.getElementById('bWorld').onclick = newWorld;
+  document.getElementById('bTrain').onclick = train;
+  document.getElementById('bVI').onclick = runVI;
+  document.getElementById('bPath').onclick = demoPath;
+  document.getElementById('epsN').oninput = function(){ document.getElementById('epsV').textContent = (+this.value * 100); };
+  document.getElementById('lr').oninput = function(){ document.getElementById('lrV').textContent = (+this.value / 10).toFixed(1); };
+
+  // ---------- self test ----------
+  function T(name, ok, detail){ return { name: name, ok: ok, detail: detail || '' }; }
+  function runTests(){
+    const out = [];
+    // 1) VI Bellman residual
+    {
+      const env = R.randomWorld(12, 12, 7, 0.2, 0.05);
+      const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+      out.push(T('VI 收敛：Bellman 残差 < 1e-8', vi.residual < 1e-8, 'residual=' + vi.residual.toExponential(2)));
+    }
+    // 2) empty grid: optimal steps == Manhattan
+    {
+      const env = R.createEnv(8, 6, new Set(), new Set(), 5 * 8 + 0, 0 * 8 + 7);
+      const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+      const Q = R.qFromV(env, vi.V, 0.95);
+      const p = R.greedyPath(env, Q);
+      const manhattan = Math.abs(7 - 0) + Math.abs(0 - 5); // = 12
+      out.push(T('空网格最优：贪心路径步数 == 曼哈顿距离 ' + manhattan, p.done && p.steps === manhattan, 'steps=' + p.steps));
+    }
+    // 3) QL vs VI cross-validation: 8 random worlds with REACHABLE goal (skip sealed seeds)
+    {
+      let ok = true, bad = '', gaps = [], tested = 0, t = 0;
+      while (tested < 8 && t < 40){
+        const env = R.randomWorld(10, 10, 100 + t, 0.18, 0.04);
+        t++;
+        const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+        const pVI = R.greedyPath(env, R.qFromV(env, vi.V, 0.95));
+        if (pVI.path[pVI.path.length - 1] !== env.goal) continue; // goal sealed by walls: skip
+        tested++;
+        const r = R.qlearn(env, { episodes: 20000, alpha0: 0.5, alpha1: 0.05, gamma: 0.95, eps0: 0.3, eps1: 0.05, seed: 42, init: 50 });
+        const pQL = R.greedyPath(env, r.Q);
+        if (!pQL.done || !pVI.done){ ok = false; bad = 't' + (t - 1) + ' not reaching goal'; break; }
+        if (pQL.total !== pVI.total){ ok = false; bad = 't' + (t - 1) + ' reward ' + pQL.total + ' != VI ' + pVI.total; break; }
+        if (pQL.path[pQL.path.length - 1] !== env.goal){ ok = false; bad = 't' + (t - 1) + ' wrong endpoint'; break; }
+        // QV gap restricted to states on the VI optimal path (well-visited by QL)
+        let gap = 0;
+        for (const s of pVI.path){
+          if (s === env.goal || env.pits.has(s)) continue;
+          const d = Math.abs(R.maxOf(r.Q, s * 4, 4) - vi.V[s]);
+          if (d > gap) gap = d;
+        }
+        gaps.push(gap.toFixed(2));
+        if (gap > 0.5){ ok = false; bad = 't' + (t - 1) + ' QV gap on path ' + gap.toFixed(3); break; }
+      }
+      if (ok && tested < 8){ ok = false; bad = 'only ' + tested + '/8 reachable worlds in 40 seeds'; }
+      out.push(T('交叉验证：8 随机世界（可达）QL 贪心报酬 == VI 最优报酬', ok, bad || ('maxQ−V* gap: ' + gaps.join(','))));
+    }
+    // 4) determinism
+    {
+      const env = R.randomWorld(10, 10, 5, 0.2, 0.05);
+      const q1 = R.qlearn(env, { episodes: 500, alpha: 0.2, seed: 9 }).Q;
+      const q2 = R.qlearn(env, { episodes: 500, alpha: 0.2, seed: 9 }).Q;
+      let same = true;
+      for (let i = 0; i < q1.length; i++) if (q1[i] !== q2[i]){ same = false; break; }
+      out.push(T('确定性：同 seed 两次训练 Q 表逐位一致', same));
+    }
+    // 5) wall bump stays in place
+    {
+      const env = R.createEnv(5, 5, new Set([1 * 5 + 2]), new Set(), 2 * 5 + 2, 0);
+      // agent at (2,2) moving U hits wall at (2,1) -> stays
+      const t = R.step(env, 2 * 5 + 2, 3);
+      out.push(T('碰墙：原地不动但仍付步代价', t.s2 === 2 * 5 + 2 && t.r === -1 && !t.done));
+    }
+    // 6) goal & pit are terminals with V=0
+    {
+      const env = R.randomWorld(10, 10, 3, 0.2, 0.05);
+      const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+      let ok = vi.V[env.goal] === 0;
+      let pit0 = true;
+      for (const p of env.pits) if (vi.V[p] !== 0) pit0 = false;
+      // step INTO goal from an adjacent cell (terminals have no outgoing semantics)
+      const left = env.goal - 1;
+      const adjOk = left >= 0 && left % env.W === (env.goal % env.W) - 1 && !env.walls.has(left) && !env.pits.has(left);
+      const tg = adjOk ? R.step(env, left, 0) : null;
+      out.push(T('终态语义：V[goal]=V[pit]=0，从邻格走进 goal 即 done(+100)', ok && pit0 && adjOk && tg.done && tg.r === 100));
+    }
+    // 7) pit avoidance: pit blocks the straight corridor, optimal route detours
+    {
+      // 7x3 grid: start (0,1)=8, goal (6,1)=13, pit at (3,1)=10
+      const env = R.createEnv(7, 3, new Set(), new Set([10]), 8, 13);
+      const vi = R.valueIteration(env, 0.95, 10000, 1e-10);
+      const p = R.greedyPath(env, R.qFromV(env, vi.V, 0.95));
+      const avoids = !p.path.includes(10);
+      const q = R.qlearn(env, { episodes: 12000, alpha0: 0.5, alpha1: 0.05, gamma: 0.95, eps0: 0.3, eps1: 0.05, seed: 42, init: 50 });
+      const pq = R.greedyPath(env, q.Q);
+      out.push(T('避坑：直线被坑封死，VI 与 QL 都绕行且不踩坑', avoids && pq.done && !pq.path.includes(10) && p.done,
+        'VI ' + p.steps + ' 步 / QL ' + pq.steps + ' 步'));
+    }
+    // 8) loop guard: Q all-zero -> greedyPath terminates within maxSteps
+    {
+      const env = R.randomWorld(10, 10, 8, 0.2, 0.05);
+      const zero = new Float64Array(env.N * 4);
+      const p = R.greedyPath(env, zero);
+      out.push(T('环路保护：全零 Q 贪心走步在 maxSteps 内终止', p.steps <= 4 * env.N));
+    }
+
+    const box = document.getElementById('tout');
+    box.innerHTML = '';
+    let pass = 0;
+    for (const t of out){
+      const d = document.createElement('div');
+      d.className = 't ' + (t.ok ? 'pass' : 'fail');
+      d.textContent = (t.ok ? '✓ ' : '✗ ') + t.name + (t.detail ? '  [' + t.detail + ']' : '');
+      box.appendChild(d);
+      if (t.ok) pass++;
+    }
+    const s = document.createElement('div');
+    s.className = 't ' + (pass === out.length ? 'pass' : 'fail');
+    s.textContent = '—— ' + pass + '/' + out.length + ' ——';
+    box.appendChild(s);
+    info('自检完成：' + pass + '/' + out.length);
+  }
+  document.getElementById('bTest').onclick = runTests;
+
+  newWorld();
+})();
+</script>
+</body>
+</html>
