@@ -1,5 +1,12 @@
 # ✦ RLForge — Q-learning 强化学习锻造炉
 
+<p align="center">
+  <a href="https://github.com/CJX0712/rl-forge/actions/workflows/ci.yml"><img src="https://github.com/CJX0712/rl-forge/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="https://github.com/CJX0712/rl-forge/releases"><img src="https://img.shields.io/github/v/release/CJX0712/rl-forge?sort=semver" alt="release"></a>
+  <a href="https://github.com/CJX0712/rl-forge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/CJX0712/rl-forge" alt="license"></a>
+  <img src="https://img.shields.io/badge/author-%E6%99%A8%E6%98%9F-1f6feb" alt="author">
+</p>
+
 单文件离线强化学习实验台：模型无关的 **Q-learning** 撞上模型方法的 **Value Iteration**，两种独立解法在随机网格世界上交叉验证。零依赖，双击 `index.html` 即用。
 
 ## 功能
